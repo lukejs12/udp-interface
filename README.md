@@ -1,28 +1,7 @@
-MatLab MEX library for receiving multicast UDP packets. This implementation splits connect and receive functionality into separate functions, so you don't have to keep opening and closing connection for every packet (which can be a big bottleneck in the code).
+Code to create a UDP interface to my double pendulum controller, which is based on an mbed STM32f746 board with ethernet. 
 
-**Basic usage example:**
-```matlab
-MC_IP   = '224.0.0.0';
-MC_PORT = 1024;
-RX_WAIT = 1;     % ms
-NUM_RX  = 100;
+The PendulumController class provides a bunch of functionality specific to controlling my single/double pendulum - cart, including homing, parameter estimation and a bit of safety code to prevent driving into the end stops at full speed.
 
-% Open UDP connection and store handle in udpH
-udpH    = udpOpen(MC_IP,MC_PORT,RX_WAIT);
+Matlab's built-in TCP/IP functionality seems to open and close a socket for each packet sent, which results in very slow throughput. To solve this, I use a compiled MEX library, based on https://github.com/stefslon/mexMulticastRX, which keeps the socket open, allowing packets to sent/received at up to 2kHz. 
 
-for irx=1:NUM_RX,
-    
-    % Receive single packet through udpH connection
-    rxPkt   = udpReceive(udpH);
-    
-    % Check if anything received
-    if ~isempty(rxPkt),
-        fprintf('Received: %s \n',char(rxPkt));
-    else
-        fprintf('Nothing received (timed-out)\n');
-    end
-end
-
-% Close udpH connection
-udpClose(udpH);
-```
+I don't intend to document this any further because it's so specific to my project, but if you're looking for a way to do fast UDP from Matlab, I suggest beginning with that library.
