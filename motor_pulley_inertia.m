@@ -1,0 +1,74 @@
+TORQUE = interface.MAX_TORQUE/10;      % Nm
+TIMEON = 2.5;        % s
+TIMEOFF = 2;       % s
+FREQUENCY = 200;    % Hz
+T = 1/FREQUENCY;    % s
+
+disp('WARNING: This will apply a constant torque to the motor. Disconnect the belt from the motor pulley.');
+yn = input('Are you sure you wish to proceed Y/[N]', 's');
+if yn ~= 'y' && yn ~= 'Y'
+    return;
+end
+input('Hit return to proceed with test - MOTOR WILL SPIN');
+[~, ~, ~, ~, ~, ~] = interface.sendPacket(interface.CMD_ENABLE, 0);
+
+x_traj = zeros(7, (TIMEON+TIMEOFF)/T);
+% Send fixed on torque
+[theta, theta_dot, enabled, homed, estop, limit] = interface.sendPacket(interface.CMD_TORQUE_OVERRIDE, TORQUE);
+
+i=1;
+t = 0;
+t_nom = 0;
+t_start = tic;
+while t < TIMEON
+    t_nom = t_nom + T;
+    while toc(t_start) < t_nom; end
+    t = toc(t_start);
+    % Get state
+%     [theta, theta_dot, enabled, homed, estop, limit] = interface.sendPacket(interface.CMD_NULL, 0);
+    [theta, theta_dot, enabled, homed, estop, limit, t_limit] = interface.sendPacket(interface.CMD_TORQUE_OVERRIDE, TORQUE);
+    x_traj(:, i) = [t theta theta_dot].';
+    i = i + 1;
+%     disp(num2str(t));
+%     disp(num2str(theta_dot(1)));
+end
+% Zero torque
+[~, ~, ~, ~, ~, ~, ~] = interface.sendPacket(interface.CMD_TORQUE, 0);
+
+% elapsed_time = 0;
+while t < (TIMEOFF+TIMEON)
+    t_nom = t_nom + T;
+    while toc(t_start) < t_nom; end
+    t = toc(t_start);
+    % Get state
+    [theta, theta_dot, enabled, homed, estop, limit, t_limit] = interface.sendPacket(interface.CMD_NULL, 0);
+    x_traj(:, i) = [t theta theta_dot].';
+    i = i + 1;
+%     disp(num2str(t));
+%     disp(num2str(theta_dot(1)));
+end
+% Disable motor
+[~, ~, ~, ~, ~, ~, ~] = interface.sendPacket(interface.CMD_DISABLE, 0);
+% Plot data
+figure;
+plot(x_traj(1, :), x_traj(5, :));
+ylabel('Angular velocity (rad/s)');
+xlabel('Time (s)');
+title(['Torque = ' num2str(TORQUE) ' Nm']);
+grid on;
+hold on;
+
+% Try and calculate inertia automatically (ignoring damping)
+x = x_traj(5, :);
+t = x_traj(1, :);
+[pks, locs] = findpeaks(x);
+plot(t(locs(1)), pks(1), 'xr');
+span = round(2*locs(1)/3);
+p = polyfit([t(1) t(span)], [x(1) x(span)], 1);
+plot(t(1:span), polyval(p, t(1:span)), 'c.');
+% Gradient of straight line during acceleration is angular acceleration.
+% Ignoring damping, inertia is torque / acceleration
+I = TORQUE/p(1);
+str = ['Motor / pulley inertia estimate: ' num2str(I) ' kg m^2']; 
+text(0.5*max(t), 0.7*max(x), str);
+disp(str);

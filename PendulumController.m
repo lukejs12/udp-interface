@@ -1,0 +1,395 @@
+classdef PendulumController < handle
+    properties (Constant)
+        % Commands
+        CMD_HOME    = 1;    % Don't use this! (Applied constant torque)
+        CMD_ENABLE  = 2;
+        CMD_DISABLE = 3;
+        CMD_TORQUE  = 4;
+        CMD_NULL    = 5;
+        % Overrides the controller's built-in safety features. Useful when 
+        % testing the motor without belt attached.
+        CMD_TORQUE_OVERRIDE = 6;
+        COMMAND_LENGTH = 9; 
+        % Number of bytes in a command
+        % 1   Command
+        % 2-9 Double
+        STATE_ENABLED = 1;
+        STATE_ESTOP = 2;
+        STATE_LIMIT = 4;
+        STATE_HOMED = 8;
+        STATE_TORQUE_LIMIT = 16;
+        % System properties
+        MAX_TORQUE = 0.6815;    % Nm
+        PULLEY_RAD = 30.60/2;   % mm
+        MAX_FORCE = 0.6815 / (30.60/2 * .001);     % N
+        TRACK_LENGTH = 1.274;   % m
+        TRACK_MARGIN = 0.15;    % m - distance from either end of track when 
+                                % emergency stop will occur when following trajectory
+    end
+    properties
+        Interface
+        homed = false;  % PC level flag indicating all axes homed (not just limit switch)
+        ThetaZero = [0; 0; 0];
+    end
+    methods %(Static)
+        function obj = PendulumController(obj)
+            % These two parameters are ignored - need to address/fix
+            MC_IP   = '224.0.0.0';
+            MC_PORT = 1024;
+            disp('Opening ethernet socket');
+            obj.Interface = udpOpen(MC_IP, MC_PORT, 20);
+        end
+        
+        function delete(obj)
+            disp('Closing ethernet socket');
+            udpClose(obj.Interface)
+        end
+        
+        function [theta, theta_dot, enabled, homed, estop, limit, torque_limit] = sendPacket(obj, cmd, value)
+            theta = [0, 0, 0];
+            theta_dot = [0, 0, 0];
+            
+            command = [cmd, typecast(value, 'uint8')];
+            val = UdpSend(obj.Interface, command);
+            val = uint8(udpReceive(obj.Interface)');
+            for i=1:3
+                theta(i) = typecast(val((i-1)*8+1:(i-1)*8+8), 'double')';
+                theta_dot(i) = typecast(val((i-1)*8+1+24:(i-1)*8+8+24), 'double')';
+            end
+            bits = val(49);
+            homed = bitget(bits, log(obj.STATE_HOMED)/log(2) + 1);
+            enabled = bitget(bits, log(obj.STATE_ENABLED)/log(2) + 1);
+            limit = bitget(bits, log(obj.STATE_LIMIT)/log(2) + 1);
+            estop = bitget(bits, log(obj.STATE_ESTOP)/log(2) + 1);
+            torque_limit = bitget(bits, log(obj.STATE_TORQUE_LIMIT)/log(2) + 1);
+        end
+        
+        function times = check_max_freq(obj, duration)
+            start_time = tic;
+            % Assume max frequency is 5kHz (actually probably 2kHz)
+            times = zeros(1, 5000*duration);
+            index = 1;
+            while toc(start_time) < duration
+                time = tic;
+                [~, ~, ~, ~, ~, ~, ~] = sendPacket(obj, obj.CMD_NULL, 0);
+                times(index) = toc(time);
+                index = index+1;
+            end
+            % Truncate times array
+            times = times(1:index);
+        end
+
+        function home(obj)
+            % PID loop to home pendulums
+            T_MAX = 0.1;            % Nm
+            V_SET = .05;%25.6128;   % mm/s
+            FREQUENCY = 500;        % Hz
+            T = 1/FREQUENCY;        % s
+            TIMEOUT = 30;           % s
+            P = .8;
+            I = .001;
+            D = -.00001;
+
+            t = tic;
+            elapsed_time = 0;
+            [theta, theta_dot, enabled, homed, estop, limit, t_limit] = obj.sendPacket(obj.CMD_ENABLE, 0);
+            lpos = theta(1);
+            err_delta = 0;
+            err_sum = 0;
+            while limit ~= true && elapsed_time < TIMEOUT
+                while toc(t) < T; end
+                t = tic;
+                % Get system state
+                [theta, theta_dot, ~, ~, ~, ~] = obj.sendPacket(obj.CMD_NULL, 0);
+                % Calculate cart position
+                pos = theta(1)*obj.PULLEY_RAD*.001;
+                % Calculate cart velocity
+                ctrvel = theta_dot(1)*obj.PULLEY_RAD*.001;
+                % Cart velocity error
+                err = V_SET - ctrvel;
+                err_sum = err_sum + err;
+                err_dot = err - err_delta;
+                % calculate PD torque
+                torque = P*err + D*err_delta + I*err_sum;
+                % Cap max torque
+                if torque > T_MAX
+                    torque = T_MAX;
+                elseif torque < -T_MAX
+                    torque = -T_MAX;
+                end
+% %                 disp(num2str(torque));
+                % Save this error
+                err_delta = err;
+                % Send torque
+                [theta, theta_dot, enabled, homed, estop, limit, t_limit] = obj.sendPacket(obj.CMD_TORQUE, torque);
+            %     disp(['H: ' num2str(homed) ', L: ' num2str(limit) ', p: ' num2str(pos) ', v: ' num2str(ctrvel) 'mm/s, T: ' num2str(torque) 'Nm, theta: [' num2str(theta(1)) ' ' num2str(theta(2)) ' ' num2str(theta(3)) ' ']);
+            %     disp(['vel: ' num2str(ctrvel) ', err: ' num2str(err) ', t: ' num2str(torque)]);
+                elapsed_time = elapsed_time + T;
+            end
+            % Turn off motor
+            [~, ~, ~, ~, ~, ~] = obj.sendPacket(obj.CMD_DISABLE, 0);
+            if elapsed_time >= TIMEOUT
+                disp('Timed out while homing!');
+                return;
+            end
+
+            disp('Limit switch found - waiting for pendula to stop swinging');
+            obj.zeroRatesWait(true);
+        end
+        
+        % Wait for zero angular rates from the controller then sets
+        % ThetaZero
+        function zeroRatesWait(obj, homePendula)
+            FREQUENCY = 500;        % Hz
+            T = 1/FREQUENCY;        % s
+            TIMEOUT = 30;           % s
+            
+            rates_hist = ones(2, FREQUENCY);    % 1s of data
+            zero_rates = false;
+            elapsed_time = 0;
+            i = 1;
+            t = tic;
+            while zero_rates ~= true && elapsed_time < TIMEOUT
+                while toc(t) < T; end
+                elapsed_time = elapsed_time + T;
+                % Get system state
+                [theta, theta_dot, enabled, homed, estop, limit, t_limit] = obj.sendPacket(obj.CMD_NULL, 0);
+            %     disp(['2, 3: [' num2str(theta_dot(2)) ', ' num2str(theta_dot(3)) ']']);
+                rates_hist(:, i) = abs(theta_dot(2:3).');
+                i = i+1;
+                if i > length(rates_hist) 
+                    i = 1;
+                end
+                avg_rates = mean(abs(rates_hist), 2);
+                if avg_rates < [0.000001; 0.000001]
+                    if homePendula == true
+                        % (re-)home pendula if asked
+                        obj.ThetaZero = [0 theta(2:3)]';
+                    end
+                    zero_rates = true;
+                end
+            end
+            disp('Pendula homing complete');
+            if elapsed_time >= TIMEOUT
+                disp('Timed out while homing!');
+            end
+            obj.homed = true;
+        end
+                
+        % Convert a raw state vector ([rad, rad, rad, rad/s, rad/s rad/s], not 
+        % zeroed) to a zeroed state vector [m, rad, rad, m/s, rad/s, rad/s]
+        % with correct axis sign convention
+        function x = convertRawState(obj, x_raw)
+            if ~obj.homed
+                error('Not homed');
+            end
+            x = (x_raw-[obj.ThetaZero; 0; 0; 0]) .* [obj.PULLEY_RAD*.001 -1 1 obj.PULLEY_RAD*.001 -1 1].' + [obj.TRACK_LENGTH/2 0 0 0 0 0]';
+        end
+        
+        % PID loop to seek cart location. Once there waits for zero
+        % pendulum rates before returning. Location is a scalar value in m
+        % from midpoint of the track. Will produce an error if system
+        % hasn't been homed.
+        function seek(obj, dest)
+            if ~obj.homed
+                error('Not homed');
+            end
+            disp(['Seeking ' num2str(dest) 'm']);
+            % Do a velocity loop to a point
+
+            T_MAX = 0.15;            % Nm
+            V_MAX = 0.15;%25.6128;    % m/s
+%             PULLEY_RAD = 30.60/2;   % mm
+            FREQUENCY = 500;        % Hz
+            T = 1/FREQUENCY;        % s
+            TIMEOUT = 30;           % s
+            P = .8; I = .001; D = -0.00001;
+
+            [theta, theta_dot, enabled, homed, estop, limit, t_limit] = obj.sendPacket(obj.CMD_ENABLE, 0);
+            x_last = obj.convertRawState([theta theta_dot]');
+            err_last = 0;
+            err_sum = 0;
+            t_act = 0;
+            t_nom = 0;
+            t_start = tic;
+            pos_err = 1;
+            
+            c = 0;
+            while abs(pos_err) > 0.001 && t_act < TIMEOUT
+                t_nom = t_nom + T;
+                while toc(t_start) < t_nom; end
+                t_act = toc(t_start);
+                % Get system state
+                [theta, theta_dot, enabled, homed, estop, limit, t_limit] = obj.sendPacket(obj.CMD_ENABLE, 0);
+                x = obj.convertRawState([theta theta_dot]');
+                % Calculate cart position error
+                pos_err = dest - x(1);
+                % Calculate target velocity proportional to position error
+                v_target = pos_err * 2;
+                if v_target > V_MAX 
+                    v_target = V_MAX;
+                elseif v_target < -V_MAX
+                    v_target = -V_MAX;
+                end
+%                 % Fixed velocity for debugging!
+%                 v_target = 0.05;
+                % Rename our current velocity
+                vel = x(4);
+                
+                % Cart velocity error
+                err = v_target - vel;
+                err_sum = err_sum + err;
+                err_dot = err - err_last;
+                % calculate PD torque
+                torque = P*err + D*err_dot + I*err_sum;
+                % Cap max torque
+                if torque > T_MAX
+                    torque = T_MAX;
+                elseif torque < -T_MAX
+                    torque = -T_MAX;
+                end
+                
+%                 c = c + 1;
+%                 if c == 50
+%                     disp([num2str(dest) ' ' num2str(x(1)) ' ' num2str(v_target) ' ' ...
+%                         num2str(vel) ' ' num2str(torque)]);
+%                     c = 0;
+%                 end
+                % Save this error
+                err_last = err;
+                % Send torque
+                obj.sendPacket(obj.CMD_TORQUE, torque);
+            end
+            % Turn off motor
+            [~, ~, ~, ~, ~, ~] = obj.sendPacket(obj.CMD_DISABLE, 0);
+            disp('Cart in position, waiting for pendulu to stop swinging');
+            obj.zeroRatesWait(false);
+        end
+        
+        function [t_traj, x_traj, u_traj] = stateFeedback(obj, setpoint, gains, duration, freq)
+            if ~obj.homed
+                disp('System not homed, can''t control');
+            end 
+            % Enable the motor
+            obj.sendPacket(obj.CMD_ENABLE, 0);
+            
+            dof = length(gains)/2;
+            t_act = 0;
+            t_nom = 0;
+            t_start = tic;
+            T = 1/freq;
+            idx = 1;
+            
+            while t_act < duration
+                t_nom = t_nom + T;
+                while toc(t_start) < t_nom; end
+                t_act = toc(t_start);
+                % Get system state
+                [theta, theta_dot, ~, ~, ~, ~, ~] = obj.sendPacket(obj.CMD_NULL, 0);
+                x = obj.convertRawState([theta theta_dot]');
+                % Calculate cart position error
+                err = setpoint - x;
+                % Calculate target velocity proportional to position error
+                torque = err*err;
+                obj.sendPacket(obj.CMD_TORQUE, torque);
+                x_traj(idx) = x;
+                u_traj(idx) = u;
+                t_traj(idx) = t_act;
+            end
+            % Turn off motor
+            obj.sendPacket(obj.CMD_DISABLE, 0);
+        end
+        
+        
+        % Follow a provided trajectory using with a given controller at
+        % frequency freq Hz
+        function [t_traj, x_traj, u_traj] = followTrajectory(obj, x_traj_nom, t_end, u_fun, freq)            
+            if ~obj.homed
+                obj.home();
+            end
+            
+            obj.seek(x_traj_nom(1));
+            % Enable the motor
+            obj.sendPacket(obj.CMD_ENABLE, 0);
+            
+            i = 1;
+            T = 1/freq;
+            [m, ~] = size(x_traj_nom);
+            % Number of DOF
+            dof = m/2;
+            x_traj = zeros(m, ceil(t_end/T));
+            t_traj = zeros(1, ceil(t_end/T));
+            u_traj = zeros(1, ceil(t_end/T));
+            t_start = tic;
+            t_nom = 0;
+            t_act = 0;
+            disp(['Duration: ' num2str(t_end) 's']);
+%             kEnergyHist = 1000*ones(1, round(freq/10));
+%             kEnergyIdx = 1;
+%             kEnergyLast = 100;
+%             cart_energy_increasing = false;
+            emergency_stop = false;
+            while t_act < t_end
+                % Wait for the next cycle
+                while toc(t_start) < t_nom; end
+                t_nom = t_nom + T;
+                % Get state, record time
+                [theta, theta_dot, ~, ~, ~, ~, ~] = obj.sendPacket(obj.CMD_NULL, 0);
+                x = obj.convertRawState([theta theta_dot]');
+                x = [x(1:dof); x(4:4+dof-1)];
+                t_act = toc(t_start);
+                
+                if ~emergency_stop
+                    % Do control loop
+                    u = u_fun(t_act, x);
+                    torque = u * (obj.PULLEY_RAD*.001);
+                    obj.sendPacket(obj.CMD_TORQUE, torque); 
+                    % Are we getting too close to end of track?
+                    if x(1) > obj.TRACK_LENGTH/2 - obj.TRACK_MARGIN || ...
+                            (x(1) < -obj.TRACK_LENGTH/2 + obj.TRACK_MARGIN)
+                        emergency_stop = true;
+                        disp('Emergency stop!');
+                        cart_stop_start_pos = x(1);
+                    end
+                else
+%                     disp(abs(x(1)) - (obj.TRACK_LENGTH/2 - obj.TRACK_MARGIN));
+                    
+                    % Stop system quickly
+                    err = -x(dof+1); % Cart velocity
+                    u = err*25.0;
+                    torque = u * (obj.PULLEY_RAD*.001);
+                    obj.sendPacket(obj.CMD_TORQUE, torque);
+                    
+                    
+%                     % Work out if kinetic energy is increasing or decreasing
+%                     kEnergyHist(kEnergyIdx) = x(dof+1)^2;
+%                     kEnergyIdx = kEnergyIdx + 1;
+%                     if kEnergyIdx > length(kEnergyHist)
+%                         kEnergyIdx = 1;
+%                     end
+%                     kEnergy = mean(kEnergyHist);
+%                     if kEnergy > kEnergyLast
+%                         % Failing to decrease kinetic energy!
+%                         cart_energy_increasing = true;
+%                     else
+%                         cart_energy_increasing = false;
+%                     end
+%                     kEnergyLast = kEnergy;
+                end
+                % Record trajectories
+                x_traj(:, i) = x;
+                u_traj(i) = u;
+                t_traj(i) = t_act;
+                % Increment counter
+                i = i + 1;
+            end
+            obj.sendPacket(obj.CMD_DISABLE, 0);
+            % Calculate overshoot if an emergency stop was required
+            if emergency_stop
+                cart_stop_end_pos = x(1);
+                overshoot = cart_stop_end_pos - cart_stop_start_pos;
+                disp(['Overshoot: ' num2str(overshoot)]);
+            end
+        end
+    end % static methods
+end 
