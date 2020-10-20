@@ -381,8 +381,8 @@ classdef PendulumController < handle
             if ~obj.homed
                 disp('System not homed, can''t control');
             end
-            if length(K) < 7 
-                disp('Gain matrix K must contain seven elements');
+            if length(K) < 6 
+                disp('Gain matrix K must contain six elements');
             end
 
             dof = length(K)/2;
@@ -391,9 +391,6 @@ classdef PendulumController < handle
             x = obj.convertRawState([theta theta_dot]');
             setpoint = [x(1) pi pi 0 0 0]';
             
-            % Initialise emergency stop safeguard
-            obj.emergencyStop(0, 0, true);
-            
             % Enable the motor
             obj.sendPacket(obj.CMD_ENABLE, 0);
             
@@ -401,8 +398,6 @@ classdef PendulumController < handle
             t_nom = 0;
             T = 1/freq;
             t_start = tic;
-            cart_error_sum = 0;
-            INT_SAT = 20;
             while t_act < duration
                 t_nom = t_nom + T;
                 while toc(t_start) < t_nom; end
@@ -412,51 +407,22 @@ classdef PendulumController < handle
                 x = obj.convertRawState([theta theta_dot]');
                 % Calculate cart position error
                 err = x - setpoint;
-                cart_error = err(1);
-                cart_error_sum = cart_error_sum + cart_error;
-                if cart_error_sum > INT_SAT
-                    cart_error_sum = INT_SAT;
-                elseif cart_error_sum < -INT_SAT
-                    cart_error_sum = -INT_SAT;
-                end
-                err = [err; cart_error_sum];
                 % Calculate target velocity proportional to position error
                 u = -K'*err;
                 torque = u * (obj.PULLEY_RAD*.001);
-%                 disp(['force: ' num2str(u)]);
-                disp(['integral: ' num2str(cart_error_sum)]);
+                disp(['force: ' num2str(u)]);
 %                 disp(['err: ' num2str(err')]);
-                if ~obj.emergencyStop(x(1), x(4))
-                    obj.sendPacket(obj.CMD_TORQUE, torque);
-                end
+           
+                obj.sendPacket(obj.CMD_TORQUE, torque);
             end
             % Turn off motor
             obj.sendPacket(obj.CMD_DISABLE, 0);
         end
         
-        % Stop the cart if it's within TRACK_MARGIN of the track end
-        function stopped = emergencyStop(obj, pos, vel, initialise)
-            persistent stop;
+        function stopped = emergencyStop(x, initialise)
             
-            if (nargin > 3) && (initialise == true)
-                stop = false;
-                return;
-            end
-
-            if ~stop
-                if pos > obj.TRACK_LENGTH/2 - obj.TRACK_MARGIN || ...
-                        (pos < -obj.TRACK_LENGTH/2 + obj.TRACK_MARGIN)
-                    stop = true;
-                    disp('Emergency stop');
-                end
-            else
-                % Stop system quickly
-                err = -vel; % Cart velocity
-                u = err*25.0;
-                torque = u * (obj.PULLEY_RAD*.001);
-                obj.sendPacket(obj.CMD_TORQUE, torque);
-            end
-            stopped = stop;
+            
+            
         end
     end % static methods
 end 

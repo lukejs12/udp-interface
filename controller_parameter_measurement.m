@@ -15,14 +15,14 @@ MODEFIT1 = 'F';
 % disp(['Enabled: ' num2str(enabled) ', homed: ' num2str(homed) ', estop: ' num2str(estop) ', limit: ' num2str(limit)]);
 % pause(0.1)
 % interface.delete();
-clc;
+
 disp('Opening connection to controller');
 interface = PendulumController();
-[theta, theta_dot, enabled, homed, estop, limit] = interface.sendPacket(interface.CMD_ENABLE, 0);
+% [theta, theta_dot, enabled, homed, estop, limit, torque_limit] = interface.sendPacket(interface.CMD_ENABLE, 0);
 
 mode = lower(MODEWAIT);
 while mode ~= lower(MODEQUIT)
-    [theta, theta_dot, enabled, homed, estop, limit] = interface.sendPacket(interface.CMD_NULL, 0);
+    [theta, theta_dot, enabled, homed, estop, limit, torque_limit] = interface.sendPacket(interface.CMD_NULL, 0);
     disp(' ');
     disp('Current state');
     disp(['Homed: ' num2str(homed) '. Theta: [' num2str(theta(1)) ' ' num2str(theta(2)) ' ' num2str(theta(3)) ']']);
